@@ -1,0 +1,1519 @@
+/*
+**
+**
+**---------------------------------------------------------------------------
+** Copyright 1999-2016 Randy Heit
+** Copyright 2005-2016 Christoph Oelckers
+** All rights reserved.
+**
+** Redistribution and use in source and binary forms, with or without
+** modification, are permitted provided that the following conditions
+** are met:
+**
+** 1. Redistributions of source code must retain the above copyright
+**    notice, this list of conditions and the following disclaimer.
+** 2. Redistributions in binary form must reproduce the above copyright
+**    notice, this list of conditions and the following disclaimer in the
+**    documentation and/or other materials provided with the distribution.
+** 3. The name of the author may not be used to endorse or promote products
+**    derived from this software without specific prior written permission.
+**
+** THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+** IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+** OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+** IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+** INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+** NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+** DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+** THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+** (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+** THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+**---------------------------------------------------------------------------
+**
+*/
+//-----------------------------------------------------------------------------
+//
+// DESCRIPTION:
+//		Functions to draw patches (by post) directly to screen->
+//		Functions to blit a block to the screen->
+//
+//-----------------------------------------------------------------------------
+
+
+#include <stdio.h>
+
+#include "i_system.h"
+#include "x86.h"
+#include "i_video.h"
+#include "r_state.h"
+
+#include "doomstat.h"
+
+#include "c_console.h"
+#include "hu_stuff.h"
+
+#include "m_argv.h"
+
+#include "v_video.h"
+#include "v_text.h"
+#include "sc_man.h"
+
+#include "w_wad.h"
+
+#include "c_dispatch.h"
+#include "cmdlib.h"
+#include "sbar.h"
+#include "hardware.h"
+#include "m_png.h"
+#include "r_utility.h"
+#include "r_renderer.h"
+#include "menu/menu.h"
+#include "vm.h"
+#include "r_videoscale.h"
+#include "i_time.h"
+
+EXTERN_CVAR(Bool, cl_capfps)
+EXTERN_CVAR(Float, vid_brightness)
+EXTERN_CVAR(Float, vid_contrast)
+CVAR(Bool, gl_scale_viewport, true, CVAR_ARCHIVE);
+EXTERN_CVAR(Int, screenblocks)
+
+CUSTOM_CVAR(Int, vid_maxfps, 200, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
+{
+	if (vid_maxfps < TICRATE && vid_maxfps != 0)
+	{
+		vid_maxfps = TICRATE;
+	}
+	else if (vid_maxfps > 1000)
+	{
+		vid_maxfps = 1000;
+	}
+	else if (cl_capfps == 0)
+	{
+		I_SetFPSLimit(vid_maxfps);
+	}
+}
+
+CUSTOM_CVAR(Int, vid_rendermode, 4, CVAR_ARCHIVE | CVAR_GLOBALCONFIG | CVAR_NOINITCALL)
+{
+	if (self < 0 || self > 4)
+	{
+		self = 4;
+	}
+
+	if (usergame)
+	{
+		// [SP] Update pitch limits to the netgame/gamesim.
+		players[consoleplayer].SendPitchLimits();
+	}
+	screen->SetTextureFilterMode();
+
+	// No further checks needed. All this changes now is which scene drawer the render backend calls.
+}
+
+CVAR(Int, vid_renderer, 1, 0)	// for some stupid mods which threw caution out of the window...
+
+
+EXTERN_CVAR(Bool, r_blendmethod)
+
+int active_con_scale();
+
+FRenderer *SWRenderer;
+
+EXTERN_CVAR (Bool, fullscreen)
+
+#define DBGBREAK assert(0)
+
+class DDummyFrameBuffer : public DFrameBuffer
+{
+	typedef DFrameBuffer Super;
+public:
+	DDummyFrameBuffer (int width, int height)
+		: DFrameBuffer (0, 0, false)
+	{
+		Width = width;
+		Height = height;
+	}
+	// These methods should never be called.
+	void Update() { DBGBREAK; }
+	bool IsFullscreen() { DBGBREAK; return 0; }
+	int GetClientWidth() { DBGBREAK; return 0; }
+	int GetClientHeight() { DBGBREAK; return 0; }
+
+	float Gamma;
+};
+
+int DisplayWidth, DisplayHeight, DisplayBits;
+
+FFont *SmallFont, *SmallFont2, *BigFont, *ConFont, *IntermissionFont;
+
+uint32_t Col2RGB8[65][256];
+uint32_t *Col2RGB8_LessPrecision[65];
+uint32_t Col2RGB8_Inverse[65][256];
+ColorTable32k RGB32k;
+ColorTable256k RGB256k;
+
+
+static uint32_t Col2RGB8_2[63][256];
+
+// [RH] The framebuffer is no longer a mere byte array.
+// There's also only one, not four.
+DFrameBuffer *screen;
+
+CVAR (Int, vid_defwidth, 640, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
+CVAR (Int, vid_defheight, 480, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
+CVAR (Int, vid_defbits, 8, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
+CVAR (Bool, vid_fps, false, 0)
+CVAR (Bool, ticker, false, 0)
+CVAR (Int, vid_showpalette, 0, 0)
+
+CUSTOM_CVAR (Bool, vid_vsync, false, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
+{
+	if (screen != NULL)
+	{
+		screen->SetVSync (*self);
+	}
+}
+
+CUSTOM_CVAR (Int, vid_refreshrate, 0, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
+{
+	if (screen != NULL)
+	{
+		screen->NewRefreshRate();
+	}
+}
+
+// [RH] Set true when vid_setmode command has been executed
+bool	setmodeneeded = false;
+// [RH] Resolution to change to when setmodeneeded is true
+int		NewWidth, NewHeight, NewBits;
+
+//==========================================================================
+//
+// DCanvas Constructor
+//
+//==========================================================================
+
+DCanvas::DCanvas (int _width, int _height, bool _bgra)
+{
+	// Init member vars
+	Width = _width;
+	Height = _height;
+	Bgra = _bgra;
+}
+
+//==========================================================================
+//
+// DCanvas Destructor
+//
+//==========================================================================
+
+DCanvas::~DCanvas ()
+{
+}
+
+//==========================================================================
+//
+// V_GetColorFromString
+//
+// Passed a string of the form "#RGB", "#RRGGBB", "R G B", or "RR GG BB",
+// returns a number representing that color. If palette is non-NULL, the
+// index of the best match in the palette is returned, otherwise the
+// RRGGBB value is returned directly.
+//
+//==========================================================================
+
+int V_GetColorFromString (const uint32_t *palette, const char *cstr, FScriptPosition *sc)
+{
+	int c[3], i, p;
+	char val[3];
+
+	val[2] = '\0';
+
+	// Check for HTML-style #RRGGBB or #RGB color string
+	if (cstr[0] == '#')
+	{
+		size_t len = strlen (cstr);
+
+		if (len == 7)
+		{
+			// Extract each eight-bit component into c[].
+			for (i = 0; i < 3; ++i)
+			{
+				val[0] = cstr[1 + i*2];
+				val[1] = cstr[2 + i*2];
+				c[i] = ParseHex (val, sc);
+			}
+		}
+		else if (len == 4)
+		{
+			// Extract each four-bit component into c[], expanding to eight bits.
+			for (i = 0; i < 3; ++i)
+			{
+				val[1] = val[0] = cstr[1 + i];
+				c[i] = ParseHex (val, sc);
+			}
+		}
+		else
+		{
+			// Bad HTML-style; pretend it's black.
+			c[2] = c[1] = c[0] = 0;
+		}
+	}
+	else
+	{
+		if (strlen(cstr) == 6)
+		{
+			char *p;
+			int color = strtol(cstr, &p, 16);
+			if (*p == 0)
+			{
+				// RRGGBB string
+				c[0] = (color & 0xff0000) >> 16;
+				c[1] = (color & 0xff00) >> 8;
+				c[2] = (color & 0xff);
+			}
+			else goto normal;
+		}
+		else
+		{
+normal:
+			// Treat it as a space-delimited hexadecimal string
+			for (i = 0; i < 3; ++i)
+			{
+				// Skip leading whitespace
+				while (*cstr <= ' ' && *cstr != '\0')
+				{
+					cstr++;
+				}
+				// Extract a component and convert it to eight-bit
+				for (p = 0; *cstr > ' '; ++p, ++cstr)
+				{
+					if (p < 2)
+					{
+						val[p] = *cstr;
+					}
+				}
+				if (p == 0)
+				{
+					c[i] = 0;
+				}
+				else
+				{
+					if (p == 1)
+					{
+						val[1] = val[0];
+					}
+					c[i] = ParseHex (val, sc);
+				}
+			}
+		}
+	}
+	if (palette)
+		return ColorMatcher.Pick (c[0], c[1], c[2]);
+	else
+		return MAKERGB(c[0], c[1], c[2]);
+}
+
+//==========================================================================
+//
+// V_GetColorStringByName
+//
+// Searches for the given color name in x11r6rgb.txt and returns an
+// HTML-ish "#RRGGBB" string for it if found or the empty string if not.
+//
+//==========================================================================
+
+FString V_GetColorStringByName (const char *name, FScriptPosition *sc)
+{
+	FMemLump rgbNames;
+	char *rgbEnd;
+	char *rgb, *endp;
+	int rgblump;
+	int c[3], step;
+	size_t namelen;
+
+	if (Wads.GetNumLumps()==0) return FString();
+
+	rgblump = Wads.CheckNumForName ("X11R6RGB");
+	if (rgblump == -1)
+	{
+		if (!sc) Printf ("X11R6RGB lump not found\n");
+		else sc->Message(MSG_WARNING, "X11R6RGB lump not found");
+		return FString();
+	}
+
+	rgbNames = Wads.ReadLump (rgblump);
+	rgb = (char *)rgbNames.GetMem();
+	rgbEnd = rgb + Wads.LumpLength (rgblump);
+	step = 0;
+	namelen = strlen (name);
+
+	while (rgb < rgbEnd)
+	{
+		// Skip white space
+		if (*rgb <= ' ')
+		{
+			do
+			{
+				rgb++;
+			} while (rgb < rgbEnd && *rgb <= ' ');
+		}
+		else if (step == 0 && *rgb == '!')
+		{ // skip comment lines
+			do
+			{
+				rgb++;
+			} while (rgb < rgbEnd && *rgb != '\n');
+		}
+		else if (step < 3)
+		{ // collect RGB values
+			c[step++] = strtoul (rgb, &endp, 10);
+			if (endp == rgb)
+			{
+				break;
+			}
+			rgb = endp;
+		}
+		else
+		{ // Check color name
+			endp = rgb;
+			// Find the end of the line
+			while (endp < rgbEnd && *endp != '\n')
+				endp++;
+			// Back up over any whitespace
+			while (endp > rgb && *endp <= ' ')
+				endp--;
+			if (endp == rgb)
+			{
+				break;
+			}
+			size_t checklen = ++endp - rgb;
+			if (checklen == namelen && strnicmp (rgb, name, checklen) == 0)
+			{
+				FString descr;
+				descr.Format ("#%02x%02x%02x", c[0], c[1], c[2]);
+				return descr;
+			}
+			rgb = endp;
+			step = 0;
+		}
+	}
+	if (rgb < rgbEnd)
+	{
+		if (!sc) Printf ("X11R6RGB lump is corrupt\n");
+		else sc->Message(MSG_WARNING, "X11R6RGB lump is corrupt");
+	}
+	return FString();
+}
+
+//==========================================================================
+//
+// V_GetColor
+//
+// Works like V_GetColorFromString(), but also understands X11 color names.
+//
+//==========================================================================
+
+int V_GetColor (const uint32_t *palette, const char *str, FScriptPosition *sc)
+{
+	FString string = V_GetColorStringByName (str, sc);
+	int res;
+
+	if (!string.IsEmpty())
+	{
+		res = V_GetColorFromString (palette, string, sc);
+	}
+	else
+	{
+		res = V_GetColorFromString (palette, str, sc);
+	}
+	return res;
+}
+
+int V_GetColor(const uint32_t *palette, FScanner &sc)
+{
+	FScriptPosition scc = sc;
+	return V_GetColor(palette, sc.String, &scc);
+}
+
+//==========================================================================
+//
+// BuildTransTable
+//
+// Build the tables necessary for blending
+//
+//==========================================================================
+
+static void BuildTransTable (const PalEntry *palette)
+{
+	int r, g, b;
+
+	// create the RGB555 lookup table
+	for (r = 0; r < 32; r++)
+		for (g = 0; g < 32; g++)
+			for (b = 0; b < 32; b++)
+				RGB32k.RGB[r][g][b] = ColorMatcher.Pick ((r<<3)|(r>>2), (g<<3)|(g>>2), (b<<3)|(b>>2));
+	// create the RGB666 lookup table
+	for (r = 0; r < 64; r++)
+		for (g = 0; g < 64; g++)
+			for (b = 0; b < 64; b++)
+				RGB256k.RGB[r][g][b] = ColorMatcher.Pick ((r<<2)|(r>>4), (g<<2)|(g>>4), (b<<2)|(b>>4));
+
+	int x, y;
+
+	// create the swizzled palette
+	for (x = 0; x < 65; x++)
+		for (y = 0; y < 256; y++)
+			Col2RGB8[x][y] = (((palette[y].r*x)>>4)<<20) |
+							  ((palette[y].g*x)>>4) |
+							 (((palette[y].b*x)>>4)<<10);
+
+	// create the swizzled palette with the lsb of red and blue forced to 0
+	// (for green, a 1 is okay since it never gets added into)
+	for (x = 1; x < 64; x++)
+	{
+		Col2RGB8_LessPrecision[x] = Col2RGB8_2[x-1];
+		for (y = 0; y < 256; y++)
+		{
+			Col2RGB8_2[x-1][y] = Col2RGB8[x][y] & 0x3feffbff;
+		}
+	}
+	Col2RGB8_LessPrecision[0] = Col2RGB8[0];
+	Col2RGB8_LessPrecision[64] = Col2RGB8[64];
+
+	// create the inverse swizzled palette
+	for (x = 0; x < 65; x++)
+		for (y = 0; y < 256; y++)
+		{
+			Col2RGB8_Inverse[x][y] = (((((255-palette[y].r)*x)>>4)<<20) |
+									  (((255-palette[y].g)*x)>>4) |
+									  ((((255-palette[y].b)*x)>>4)<<10)) & 0x3feffbff;
+		}
+}
+
+//==========================================================================
+//
+// DCanvas :: CalcGamma
+//
+//==========================================================================
+
+void DFrameBuffer::CalcGamma (float gamma, uint8_t gammalookup[256])
+{
+	// I found this formula on the web at
+	// <http://panda.mostang.com/sane/sane-gamma.html>,
+	// but that page no longer exits.
+	double invgamma = 1.f / gamma;
+	int i;
+
+	for (i = 0; i < 256; i++)
+	{
+		gammalookup[i] = (uint8_t)(255.0 * pow (i / 255.0, invgamma) + 0.5);
+	}
+}
+
+//==========================================================================
+//
+// DSimpleCanvas Constructor
+//
+// A simple canvas just holds a buffer in main memory.
+//
+//==========================================================================
+
+DSimpleCanvas::DSimpleCanvas (int width, int height, bool bgra)
+	: DCanvas (width, height, bgra)
+{
+	PixelBuffer = nullptr;
+	Resize(width, height);
+}
+
+void DSimpleCanvas::Resize(int width, int height)
+{
+	Width = width;
+	Height = height;
+
+	if (PixelBuffer != NULL)
+	{
+		delete[] PixelBuffer;
+		PixelBuffer = NULL;
+	}
+
+	// Making the pitch a power of 2 is very bad for performance
+	// Try to maximize the number of cache lines that can be filled
+	// for each column drawing operation by making the pitch slightly
+	// longer than the width. The values used here are all based on
+	// empirical evidence.
+
+	if (width <= 640)
+	{
+		// For low resolutions, just keep the pitch the same as the width.
+		// Some speedup can be seen using the technique below, but the speedup
+		// is so marginal that I don't consider it worthwhile.
+		Pitch = width;
+	}
+	else
+	{
+		// If we couldn't figure out the CPU's L1 cache line size, assume
+		// it's 32 bytes wide.
+		if (CPU.DataL1LineSize == 0)
+		{
+			CPU.DataL1LineSize = 32;
+		}
+		// The Athlon and P3 have very different caches, apparently.
+		// I am going to generalize the Athlon's performance to all AMD
+		// processors and the P3's to all non-AMD processors. I don't know
+		// how smart that is, but I don't have a vast plethora of
+		// processors to test with.
+		if (CPU.bIsAMD)
+		{
+			Pitch = width + CPU.DataL1LineSize;
+		}
+		else
+		{
+			Pitch = width + MAX(0, CPU.DataL1LineSize - 8);
+		}
+	}
+	int bytes_per_pixel = Bgra ? 4 : 1;
+	PixelBuffer = new uint8_t[Pitch * height * bytes_per_pixel];
+	memset (PixelBuffer, 0, Pitch * height * bytes_per_pixel);
+}
+
+//==========================================================================
+//
+// DSimpleCanvas Destructor
+//
+//==========================================================================
+
+DSimpleCanvas::~DSimpleCanvas ()
+{
+	if (PixelBuffer != NULL)
+	{
+		delete[] PixelBuffer;
+		PixelBuffer = NULL;
+	}
+}
+
+//==========================================================================
+//
+// DFrameBuffer Constructor
+//
+// A frame buffer canvas is the most common and represents the image that
+// gets drawn to the screen.
+//
+//==========================================================================
+
+DFrameBuffer::DFrameBuffer (int width, int height, bool bgra)
+	//: DCanvas 
+{
+	Width = ViewportScaledWidth(width, height);
+	Height = ViewportScaledHeight(width, height);
+	Bgra = bgra;
+
+	LastMS = LastSec = FrameCount = LastCount = LastTic = 0;
+
+	VideoWidth = width;
+	VideoHeight = height;
+}
+
+//==========================================================================
+//
+// 
+//
+//==========================================================================
+
+void V_DrawPaletteTester(int paletteno)
+{
+	int blocksize = screen->GetHeight() / 50;
+
+	int t = paletteno;
+	int k = 0;
+	for (int i = 0; i < 16; ++i)
+	{
+		for (int j = 0; j < 16; ++j)
+		{
+			int palindex = (t > 1) ? translationtables[TRANSLATION_Standard][t - 2]->Remap[k] : k;
+			PalEntry pe = GPalette.BaseColors[palindex];
+			k++;
+			screen->Dim(pe, 1.f, j*blocksize, i*blocksize, blocksize, blocksize);
+		}
+	}
+}
+
+//==========================================================================
+//
+// DFrameBuffer :: DrawRateStuff
+//
+// Draws the fps counter, dot ticker, and palette debug.
+//
+//==========================================================================
+
+void DFrameBuffer::DrawRateStuff ()
+{
+	// Draws frame time and cumulative fps
+	if (vid_fps)
+	{
+		uint64_t ms = screen->FrameTime;
+		uint64_t howlong = ms - LastMS;
+		if ((signed)howlong >= 0)
+		{
+			char fpsbuff[40];
+			int chars;
+			int rate_x;
+
+			int textScale = active_con_scale();
+
+			chars = mysnprintf (fpsbuff, countof(fpsbuff), "%2" PRIu64 " ms (%3" PRIu64 " fps)", howlong, LastCount);
+			rate_x = Width / textScale - ConFont->StringWidth(&fpsbuff[0]);
+			Clear (rate_x * textScale, 0, Width, ConFont->GetHeight() * textScale, GPalette.BlackIndex, 0);
+			DrawText (ConFont, CR_WHITE, rate_x, 0, (char *)&fpsbuff[0],
+				DTA_VirtualWidth, screen->GetWidth() / textScale,
+				DTA_VirtualHeight, screen->GetHeight() / textScale,
+				DTA_KeepRatio, true, TAG_DONE);
+
+			uint32_t thisSec = (uint32_t)(ms/1000);
+			if (LastSec < thisSec)
+			{
+				LastCount = FrameCount / (thisSec - LastSec);
+				LastSec = thisSec;
+				FrameCount = 0;
+			}
+			FrameCount++;
+		}
+		LastMS = ms;
+	}
+
+	// draws little dots on the bottom of the screen
+	if (ticker)
+	{
+		int64_t t = I_GetTime();
+		int64_t tics = t - LastTic;
+
+		LastTic = t;
+		if (tics > 20) tics = 20;
+
+		int i;
+		for (i = 0; i < tics*2; i += 2)		Clear(i, Height-1, i+1, Height, 255, 0);
+		for ( ; i < 20*2; i += 2)			Clear(i, Height-1, i+1, Height, 0, 0);
+	}
+
+	// draws the palette for debugging
+	if (vid_showpalette)
+	{
+		V_DrawPaletteTester(vid_showpalette);
+	}
+}
+
+//==========================================================================
+//
+// Palette stuff.
+//
+//==========================================================================
+
+void DFrameBuffer::GetFlashedPalette(PalEntry pal[256])
+{
+	DoBlending(SourcePalette, pal, 256, Flash.r, Flash.g, Flash.b, Flash.a);
+}
+
+PalEntry *DFrameBuffer::GetPalette()
+{
+	return SourcePalette;
+}
+
+bool DFrameBuffer::SetFlash(PalEntry rgb, int amount)
+{
+	Flash = PalEntry(amount, rgb.r, rgb.g, rgb.b);
+	return true;
+}
+
+void DFrameBuffer::GetFlash(PalEntry &rgb, int &amount)
+{
+	rgb = Flash;
+	rgb.a = 0;
+	amount = Flash.a;
+}
+
+
+//==========================================================================
+//
+// DFrameBuffer :: SetVSync
+//
+// Turns vertical sync on and off, if supported.
+//
+//==========================================================================
+
+void DFrameBuffer::SetVSync (bool vsync)
+{
+}
+
+//==========================================================================
+//
+// DFrameBuffer :: NewRefreshRate
+//
+// Sets the fullscreen display to the new refresh rate in vid_refreshrate,
+// if possible.
+//
+//==========================================================================
+
+void DFrameBuffer::NewRefreshRate ()
+{
+}
+
+//==========================================================================
+//
+// DFrameBuffer :: WipeStartScreen
+//
+// Grabs a copy of the screen currently displayed to serve as the initial
+// frame of a screen wipe. Also determines which screenwipe will be
+// performed.
+//
+//==========================================================================
+
+bool DFrameBuffer::WipeStartScreen(int type)
+{
+	return false;
+}
+
+//==========================================================================
+//
+// DFrameBuffer :: WipeEndScreen
+//
+// Grabs a copy of the most-recently drawn, but not yet displayed, screen
+// to serve as the final frame of a screen wipe.
+//
+//==========================================================================
+
+void DFrameBuffer::WipeEndScreen()
+{
+}
+
+//==========================================================================
+//
+// DFrameBuffer :: WipeDo
+//
+// Draws one frame of a screenwipe. Should be called no more than 35
+// times per second. If called less than that, ticks indicates how many
+// ticks have passed since the last call.
+//
+//==========================================================================
+
+bool DFrameBuffer::WipeDo(int ticks)
+{
+	return false;
+}
+
+//==========================================================================
+//
+// DFrameBuffer :: WipeCleanup
+//
+//==========================================================================
+
+void DFrameBuffer::WipeCleanup()
+{
+}
+
+//==========================================================================
+//
+// DFrameBuffer :: InitPalette
+//
+//==========================================================================
+
+void DFrameBuffer::InitPalette()
+{
+	memcpy(SourcePalette, GPalette.BaseColors, sizeof(PalEntry) * 256);
+	UpdatePalette();
+}
+
+//==========================================================================
+//
+//
+//
+//==========================================================================
+
+void DFrameBuffer::BuildGammaTable(uint16_t *gammaTable)
+{
+	float gamma = clamp<float>(Gamma, 0.1f, 4.f);
+	float contrast = clamp<float>(vid_contrast, 0.1f, 3.f);
+	float bright = clamp<float>(vid_brightness, -0.8f, 0.8f);
+
+	double invgamma = 1 / gamma;
+	double norm = pow(255., invgamma - 1);
+
+	for (int i = 0; i < 256; i++)
+	{
+		double val = i * contrast - (contrast - 1) * 127;
+		val += bright * 128;
+		if (gamma != 1) val = pow(val, invgamma) / norm;
+
+		gammaTable[i] = gammaTable[i + 256] = gammaTable[i + 512] = (uint16_t)clamp<double>(val * 256, 0, 0xffff);
+	}
+}
+
+//==========================================================================
+//
+// DFrameBuffer :: GetCaps
+//
+//==========================================================================
+
+EXTERN_CVAR(Bool, r_drawvoxels)
+
+uint32_t DFrameBuffer::GetCaps()
+{
+	ActorRenderFeatureFlags FlagSet = 0;
+
+	if (V_IsPolyRenderer())
+		FlagSet |= RFF_POLYGONAL | RFF_TILTPITCH | RFF_SLOPE3DFLOORS;
+	else
+	{
+		FlagSet |= RFF_UNCLIPPEDTEX;
+		if (r_drawvoxels)
+			FlagSet |= RFF_VOXELS;
+	}
+
+	if (V_IsTrueColor())
+		FlagSet |= RFF_TRUECOLOR;
+	else
+		FlagSet |= RFF_COLORMAP;
+
+	return (uint32_t)FlagSet;
+}
+
+void DFrameBuffer::RenderTextureView(FCanvasTexture *tex, AActor *Viewpoint, double FOV)
+{
+	SWRenderer->RenderTextureView(tex, Viewpoint, FOV);
+}
+
+void DFrameBuffer::WriteSavePic(player_t *player, FileWriter *file, int width, int height)
+{
+	SWRenderer->WriteSavePic(player, file, width, height);
+}
+
+
+//==========================================================================
+//
+// Calculates the viewport values needed for 2D and 3D operations
+//
+//==========================================================================
+
+void DFrameBuffer::SetViewportRects(IntRect *bounds)
+{
+	if (bounds)
+	{
+		mSceneViewport = *bounds;
+		mScreenViewport = *bounds;
+		mOutputLetterbox = *bounds;
+		return;
+	}
+
+	// Special handling so the view with a visible status bar displays properly
+	int height, width;
+	if (screenblocks >= 10)
+	{
+		height = GetHeight();
+		width = GetWidth();
+	}
+	else
+	{
+		height = (screenblocks*GetHeight() / 10) & ~7;
+		width = (screenblocks*GetWidth() / 10);
+	}
+
+	// Back buffer letterbox for the final output
+	int clientWidth = GetClientWidth();
+	int clientHeight = GetClientHeight();
+	if (clientWidth == 0 || clientHeight == 0)
+	{
+		// When window is minimized there may not be any client area.
+		// Pretend to the rest of the render code that we just have a very small window.
+		clientWidth = 160;
+		clientHeight = 120;
+	}
+	int screenWidth = GetWidth();
+	int screenHeight = GetHeight();
+	float scaleX, scaleY;
+	if (ViewportIsScaled43())
+	{
+		scaleX = MIN(clientWidth / (float)screenWidth, clientHeight / (screenHeight * 1.2f));
+		scaleY = scaleX * 1.2f;
+	}
+	else
+	{
+		scaleX = MIN(clientWidth / (float)screenWidth, clientHeight / (float)screenHeight);
+		scaleY = scaleX;
+	}
+	mOutputLetterbox.width = (int)round(screenWidth * scaleX);
+	mOutputLetterbox.height = (int)round(screenHeight * scaleY);
+	mOutputLetterbox.left = (clientWidth - mOutputLetterbox.width) / 2;
+	mOutputLetterbox.top = (clientHeight - mOutputLetterbox.height) / 2;
+
+	// The entire renderable area, including the 2D HUD
+	mScreenViewport.left = 0;
+	mScreenViewport.top = 0;
+	mScreenViewport.width = screenWidth;
+	mScreenViewport.height = screenHeight;
+
+	// Viewport for the 3D scene
+	mSceneViewport.left = viewwindowx;
+	mSceneViewport.top = screenHeight - (height + viewwindowy - ((height - viewheight) / 2));
+	mSceneViewport.width = viewwidth;
+	mSceneViewport.height = height;
+
+	// Scale viewports to fit letterbox
+	bool notScaled = ((mScreenViewport.width == ViewportScaledWidth(mScreenViewport.width, mScreenViewport.height)) &&
+		(mScreenViewport.width == ViewportScaledHeight(mScreenViewport.width, mScreenViewport.height)) &&
+		!ViewportIsScaled43());
+	if ((gl_scale_viewport && !IsFullscreen() && notScaled) || !RenderBuffersEnabled())
+	{
+		mScreenViewport.width = mOutputLetterbox.width;
+		mScreenViewport.height = mOutputLetterbox.height;
+		mSceneViewport.left = (int)round(mSceneViewport.left * scaleX);
+		mSceneViewport.top = (int)round(mSceneViewport.top * scaleY);
+		mSceneViewport.width = (int)round(mSceneViewport.width * scaleX);
+		mSceneViewport.height = (int)round(mSceneViewport.height * scaleY);
+
+		// Without render buffers we have to render directly to the letterbox
+		if (!RenderBuffersEnabled())
+		{
+			mScreenViewport.left += mOutputLetterbox.left;
+			mScreenViewport.top += mOutputLetterbox.top;
+			mSceneViewport.left += mOutputLetterbox.left;
+			mSceneViewport.top += mOutputLetterbox.top;
+		}
+	}
+}
+
+//===========================================================================
+// 
+// Calculates the OpenGL window coordinates for a zdoom screen position
+//
+//===========================================================================
+
+int DFrameBuffer::ScreenToWindowX(int x)
+{
+	return mScreenViewport.left + (int)round(x * mScreenViewport.width / (float)GetWidth());
+}
+
+int DFrameBuffer::ScreenToWindowY(int y)
+{
+	return mScreenViewport.top + mScreenViewport.height - (int)round(y * mScreenViewport.height / (float)GetHeight());
+}
+
+void DFrameBuffer::ScaleCoordsFromWindow(int16_t &x, int16_t &y)
+{
+	int letterboxX = mOutputLetterbox.left;
+	int letterboxY = mOutputLetterbox.top;
+	int letterboxWidth = mOutputLetterbox.width;
+	int letterboxHeight = mOutputLetterbox.height;
+
+	// Subtract the LB video mode letterboxing
+	if (IsFullscreen())
+		y -= (GetTrueHeight() - VideoHeight) / 2;
+
+	x = int16_t((x - letterboxX) * Width / letterboxWidth);
+	y = int16_t((y - letterboxY) * Height / letterboxHeight);
+}
+
+
+
+
+CCMD(clean)
+{
+	Printf ("CleanXfac: %d\nCleanYfac: %d\n", CleanXfac, CleanYfac);
+}
+
+//
+// V_SetResolution
+//
+bool V_DoModeSetup (int width, int height, int bits)
+{
+	DFrameBuffer *buff = I_SetMode (width, height, screen);
+
+	if (buff == NULL)
+	{
+		return false;
+	}
+
+	screen = buff;
+	screen->SetGamma ();
+
+	DisplayBits = bits;
+	V_UpdateModeSize(screen->GetWidth(), screen->GetHeight());
+
+	M_RefreshModesList ();
+
+	return true;
+}
+
+void V_UpdateModeSize (int width, int height)
+{
+	int cx1, cx2;
+	V_CalcCleanFacs(320, 200, width, height, &CleanXfac, &CleanYfac, &cx1, &cx2);
+
+	CleanWidth = width / CleanXfac;
+	CleanHeight = height / CleanYfac;
+	assert(CleanWidth >= 320 && CleanHeight >= 200);
+
+	if (width < 800 || width >= 960)
+	{
+		if (cx1 < cx2)
+		{
+			// Special case in which we don't need to scale down.
+			CleanXfac_1 = 
+			CleanYfac_1 = cx1;
+		}
+		else
+		{
+			CleanXfac_1 = MAX(CleanXfac - 1, 1);
+			CleanYfac_1 = MAX(CleanYfac - 1, 1);
+			// On larger screens this is not enough so make sure it's at most 3/4 of the screen's width
+			while (CleanXfac_1 * 320 > screen->GetWidth()*3/4 && CleanXfac_1 > 2)
+			{
+				CleanXfac_1--;
+				CleanYfac_1--;
+			}
+		}
+		CleanWidth_1 = width / CleanXfac_1;
+		CleanHeight_1 = height / CleanYfac_1;
+	}
+	else // if the width is between 800 and 960 the ratio between the screensize and CleanXFac-1 becomes too large.
+	{
+		CleanXfac_1 = CleanXfac;
+		CleanYfac_1 = CleanYfac;
+		CleanWidth_1 = CleanWidth;
+		CleanHeight_1 = CleanHeight;
+	}
+
+
+	DisplayWidth = width;
+	DisplayHeight = height;
+
+	R_OldBlend = ~0;
+}
+
+void V_OutputResized (int width, int height)
+{
+	V_UpdateModeSize(width, height);
+	setsizeneeded = true;
+	if (StatusBar != NULL)
+	{
+		StatusBar->CallScreenSizeChanged();
+	}
+	C_NewModeAdjust();
+}
+
+void V_CalcCleanFacs (int designwidth, int designheight, int realwidth, int realheight, int *cleanx, int *cleany, int *_cx1, int *_cx2)
+{
+	float ratio;
+	int cwidth;
+	int cheight;
+	int cx1, cy1, cx2, cy2;
+
+	// For larger screems always use at least a 16:9 ratio for clean factor calculation, even if the actual ratio is narrower.
+	if (realwidth > 1280 && (double)realwidth / realheight < 16./9)
+	{
+		realheight = realwidth * 9 / 16;
+	}
+
+	ratio = ActiveRatio(realwidth, realheight);
+	if (AspectTallerThanWide(ratio))
+	{
+		cwidth = realwidth;
+		cheight = realheight * AspectMultiplier(ratio) / 48;
+	}
+	else
+	{
+		cwidth = realwidth * AspectMultiplier(ratio) / 48;
+		cheight = realheight;
+	}
+	// Use whichever pair of cwidth/cheight or width/height that produces less difference
+	// between CleanXfac and CleanYfac.
+	cx1 = MAX(cwidth / designwidth, 1);
+	cy1 = MAX(cheight / designheight, 1);
+	cx2 = MAX(realwidth / designwidth, 1);
+	cy2 = MAX(realheight / designheight, 1);
+	if (abs(cx1 - cy1) <= abs(cx2 - cy2) || MAX(cx1, cx2) >= 4)
+	{ // e.g. 640x360 looks better with this.
+		*cleanx = cx1;
+		*cleany = cy1;
+	}
+	else
+	{ // e.g. 720x480 looks better with this.
+		*cleanx = cx2;
+		*cleany = cy2;
+	}
+
+	if (*cleanx < *cleany)
+		*cleany = *cleanx;
+	else
+		*cleanx = *cleany;
+
+	if (_cx1 != NULL)	*_cx1 = cx1;
+	if (_cx2 != NULL)	*_cx2 = cx2;
+}
+
+bool IVideo::SetResolution (int width, int height, int bits)
+{
+	int oldwidth, oldheight;
+	int oldbits;
+
+	if (screen)
+	{
+		oldwidth = SCREENWIDTH;
+		oldheight = SCREENHEIGHT;
+		oldbits = DisplayBits;
+	}
+	else
+	{ // Harmless if screen wasn't allocated
+		oldwidth = width;
+		oldheight = height;
+		oldbits = bits;
+	}
+
+	I_ClosestResolution (&width, &height, bits);
+	if (!I_CheckResolution (width, height, bits))
+	{ // Try specified resolution
+		if (!I_CheckResolution (oldwidth, oldheight, oldbits))
+		{ // Try previous resolution (if any)
+	   		return false;
+		}
+		else
+		{
+			width = oldwidth;
+			height = oldheight;
+			bits = oldbits;
+		}
+	}
+	return V_DoModeSetup (width, height, bits);
+}
+
+CCMD (vid_setmode)
+{
+	int		width = 0, height = SCREENHEIGHT;
+	int		bits = DisplayBits;
+
+	if (argv.argc() > 1)
+	{
+		width = atoi (argv[1]);
+		if (argv.argc() > 2)
+		{
+			height = atoi (argv[2]);
+			if (argv.argc() > 3)
+			{
+				bits = atoi (argv[3]);
+			}
+		}
+	}
+
+	const bool goodmode = (width > 0 && height > 0)
+		&& (!fullscreen || (Video != nullptr && I_CheckResolution(width, height, bits)));
+
+	if (goodmode)
+	{
+		// The actual change of resolution will take place
+		// near the beginning of D_Display().
+		if (gamestate != GS_STARTUP)
+		{
+			setmodeneeded = true;
+			NewWidth = width;
+			NewHeight = height;
+			NewBits = bits;
+		}
+	}
+	else if (width)
+	{
+		Printf ("Unknown resolution %d x %d x %d\n", width, height, bits);
+	}
+	else
+	{
+		Printf ("Usage: vid_setmode <width> <height> <mode>\n");
+	}
+}
+
+//
+// V_Init
+//
+
+void V_Init (bool restart) 
+{ 
+	const char *i;
+	int width, height, bits;
+
+	atterm (V_Shutdown);
+
+	// [RH] Initialize palette management
+	InitPalette ();
+
+	if (!restart)
+	{
+		width = height = bits = 0;
+
+		if ( (i = Args->CheckValue ("-width")) )
+			width = atoi (i);
+
+		if ( (i = Args->CheckValue ("-height")) )
+			height = atoi (i);
+
+		if ( (i = Args->CheckValue ("-bits")) )
+			bits = atoi (i);
+
+		if (width == 0)
+		{
+			if (height == 0)
+			{
+				width = vid_defwidth;
+				height = vid_defheight;
+			}
+			else
+			{
+				width = (height * 8) / 6;
+			}
+		}
+		else if (height == 0)
+		{
+			height = (width * 6) / 8;
+		}
+
+		if (bits == 0)
+		{
+			bits = vid_defbits;
+		}
+		screen = new DDummyFrameBuffer (width, height);
+	}
+	// Update screen palette when restarting
+	else
+	{
+		PalEntry *palette = screen->GetPalette ();
+		for (int i = 0; i < 256; ++i)
+			*palette++ = GPalette.BaseColors[i];
+		screen->UpdatePalette();
+	}
+
+	BuildTransTable (GPalette.BaseColors);
+}
+
+void V_Init2()
+{
+	int width = screen->GetWidth();
+	int height = screen->GetHeight();
+	float gamma = static_cast<DDummyFrameBuffer *>(screen)->Gamma;
+
+	{
+		DFrameBuffer *s = screen;
+		screen = NULL;
+		delete s;
+	}
+
+	I_InitGraphics();
+	I_ClosestResolution (&width, &height, 8);
+
+	if (!Video->SetResolution (width, height, 8))
+		I_FatalError ("Could not set resolution to %d x %d x %d", width, height, 8);
+	else
+		Printf ("Resolution: %d x %d\n", SCREENWIDTH, SCREENHEIGHT);
+
+	screen->SetGamma ();
+	FBaseCVar::ResetColors ();
+	C_NewModeAdjust();
+	M_InitVideoModesMenu();
+	setsizeneeded = true;
+}
+
+void V_Shutdown()
+{
+	if (screen)
+	{
+		DFrameBuffer *s = screen;
+		screen = NULL;
+		delete s;
+	}
+	V_ClearFonts();
+}
+
+CUSTOM_CVAR (Int, vid_aspect, 0, CVAR_GLOBALCONFIG|CVAR_ARCHIVE)
+{
+	setsizeneeded = true;
+	if (StatusBar != NULL)
+	{
+		StatusBar->CallScreenSizeChanged();
+	}
+}
+
+// Helper for ActiveRatio and CheckRatio. Returns the forced ratio type, or -1 if none.
+int ActiveFakeRatio(int width, int height)
+{
+	int fakeratio = -1;
+	if ((vid_aspect >= 1) && (vid_aspect <= 6))
+	{
+		// [SP] User wants to force aspect ratio; let them.
+		fakeratio = int(vid_aspect);
+		if (fakeratio == 3)
+		{
+			fakeratio = 0;
+		}
+		else if (fakeratio == 5)
+		{
+			fakeratio = 3;
+		}
+	}
+	else if (vid_aspect == 0 && ViewportIsScaled43())
+	{
+		fakeratio = 0;
+	}
+	return fakeratio;
+}
+
+// Active screen ratio based on cvars and size
+float ActiveRatio(int width, int height, float *trueratio)
+{
+	static float forcedRatioTypes[] =
+	{
+		4 / 3.0f,
+		16 / 9.0f,
+		16 / 10.0f,
+		17 / 10.0f,
+		5 / 4.0f,
+		17 / 10.0f,
+		21 / 9.0f
+	};
+
+	float ratio = width / (float)height;
+	int fakeratio = ActiveFakeRatio(width, height);
+
+	if (trueratio)
+		*trueratio = ratio;
+	return (fakeratio != -1) ? forcedRatioTypes[fakeratio] : ratio;
+}
+
+DEFINE_ACTION_FUNCTION(_Screen, GetAspectRatio)
+{
+	ACTION_RETURN_FLOAT(ActiveRatio(screen->GetWidth(), screen->GetHeight(), nullptr));
+}
+
+// Tries to guess the physical dimensions of the screen based on the
+// screen's pixel dimensions. Can return:
+// 0: 4:3
+// 1: 16:9
+// 2: 16:10
+// 3: 17:10
+// 4: 5:4
+// 5: 17:10 (redundant, never returned)
+// 6: 21:9
+int CheckRatio (int width, int height, int *trueratio)
+{
+	float aspect = width / (float)height;
+
+	static std::pair<float, int> ratioTypes[] =
+	{
+		{ 21 / 9.0f , 6 },
+		{ 16 / 9.0f , 1 },
+		{ 17 / 10.0f , 3 },
+		{ 16 / 10.0f , 2 },
+		{ 4 / 3.0f , 0 },
+		{ 5 / 4.0f , 4 },
+		{ 0.0f, 0 }
+	};
+
+	int ratio = ratioTypes[0].second;
+	float distance = fabs(ratioTypes[0].first - aspect);
+	for (int i = 1; ratioTypes[i].first != 0.0f; i++)
+	{
+		float d = fabs(ratioTypes[i].first - aspect);
+		if (d < distance)
+		{
+			ratio = ratioTypes[i].second;
+			distance = d;
+		}
+	}
+
+	int fakeratio = ActiveFakeRatio(width, height);
+	if (fakeratio == -1)
+		fakeratio = ratio;
+
+	if (trueratio)
+		*trueratio = ratio;
+	return fakeratio;
+}
+
+int AspectBaseWidth(float aspect)
+{
+	return (int)round(240.0f * aspect * 3.0f);
+}
+
+int AspectBaseHeight(float aspect)
+{
+	if (!AspectTallerThanWide(aspect))
+		return (int)round(200.0f * (320.0f / (AspectBaseWidth(aspect) / 3.0f)) * 3.0f);
+	else
+		return (int)round((200.0f * (4.0f / 3.0f)) / aspect * 3.0f);
+}
+
+double AspectPspriteOffset(float aspect)
+{
+	if (!AspectTallerThanWide(aspect))
+		return 0.0;
+	else
+		return ((4.0 / 3.0) / aspect - 1.0) * 97.5;
+}
+
+int AspectMultiplier(float aspect)
+{
+	if (!AspectTallerThanWide(aspect))
+		return (int)round(320.0f / (AspectBaseWidth(aspect) / 3.0f) * 48.0f);
+	else
+		return (int)round(200.0f / (AspectBaseHeight(aspect) / 3.0f) * 48.0f);
+}
+
+bool AspectTallerThanWide(float aspect)
+{
+	return aspect < 1.333f;
+}
+
+void ScaleWithAspect (int &w, int &h, int Width, int Height)
+{
+	int resRatio = CheckRatio (Width, Height);
+	int screenRatio;
+	CheckRatio (w, h, &screenRatio);
+	if (resRatio == screenRatio)
+		return;
+
+	double yratio;
+	switch(resRatio)
+	{
+		case 0: yratio = 4./3.; break;
+		case 1: yratio = 16./9.; break;
+		case 2: yratio = 16./10.; break;
+		case 3: yratio = 17./10.; break;
+		case 4: yratio = 5./4.; break;
+		case 6: yratio = 21./9.; break;
+		default: return;
+	}
+	double y = w/yratio;
+	if (y > h)
+		w = static_cast<int>(h * yratio);
+	else
+		h = static_cast<int>(y);
+}
+
+void IVideo::DumpAdapters ()
+{
+	Printf("Multi-monitor support unavailable.\n");
+}
+
+CCMD(vid_listadapters)
+{
+	if (Video != NULL)
+		Video->DumpAdapters();
+}
+
+DEFINE_GLOBAL(SmallFont)
+DEFINE_GLOBAL(SmallFont2)
+DEFINE_GLOBAL(BigFont)
+DEFINE_GLOBAL(ConFont)
+DEFINE_GLOBAL(IntermissionFont)
+DEFINE_GLOBAL(CleanXfac)
+DEFINE_GLOBAL(CleanYfac)
+DEFINE_GLOBAL(CleanWidth)
+DEFINE_GLOBAL(CleanHeight)
+DEFINE_GLOBAL(CleanXfac_1)
+DEFINE_GLOBAL(CleanYfac_1)
+DEFINE_GLOBAL(CleanWidth_1)
+DEFINE_GLOBAL(CleanHeight_1)
